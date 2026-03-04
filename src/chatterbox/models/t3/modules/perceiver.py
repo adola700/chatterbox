@@ -1,3 +1,46 @@
+"""
+Perceiver Resampler — Compresses variable-length speech conditioning into fixed-length tokens.
+
+Used by T3CondEnc to compress 150 speech conditioning embeddings (6s of reference audio
+at 25 tokens/sec) into 32 fixed-length conditioning tokens via cross-attention + self-attention.
+
+Architecture
+============
+    Input:  (B, 150, 1024)  — speech conditioning embeddings from T3.speech_emb + speech_pos_emb
+    Output: (B, 32, 1024)   — compressed conditioning tokens prepended to transformer input
+
+    Step 1 — Cross-attention:
+        Q = 32 learned query tokens (1, 32, 1024) → expanded to (B, 32, 1024)
+        K, V = input speech embeddings (B, 150, 1024)
+        → pre_att = (B, 32, 1024)
+
+    Step 2 — Self-attention:
+        Q = K = V = pre_att (B, 32, 1024)
+        → output = (B, 32, 1024)
+
+Components
+----------
+    Perceiver
+        pre_attention_query : nn.Parameter(1, 32, 1024) — learned query tokens
+        attn : AttentionBlock2 — shared attention block used for both cross and self attention
+
+    AttentionBlock2
+        norm   : LayerNorm(1024)
+        to_q   : Linear(1024, 1024)
+        to_k   : Linear(1024, 1024)
+        to_v   : Linear(1024, 1024)
+        attention : AttentionQKV(4 heads, head_dim=256, flash=True)
+        proj_out  : Linear(1024, 1024)
+        Residual connection: output = x1 + proj_out(attention(q, k, v))
+
+    AttentionQKV
+        4 heads, head_dim=256, scale=256^-0.5
+        Flash attention (torch.backends.cuda.sdp_kernel) when available
+        Fallback: manual scaled dot-product with einsum
+
+    RelativePositionBias (optional, NOT used in default Perceiver config)
+        Logarithmic relative position bucketing for attention bias.
+"""
 # Copyright (c) 2025 Resemble AI
 # Author: Manmay Nakhashi
 # MIT License
@@ -171,15 +214,36 @@ class AttentionBlock2(nn.Module):
 
 
 class Perceiver(nn.Module):
-    """Inspired by https://arxiv.org/abs/2103.03206"""
+    """Perceiver Resampler — compresses speech conditioning via cross-attention + self-attention.
+
+    Inspired by https://arxiv.org/abs/2103.03206
+
+    Default config (used by T3CondEnc):
+        pre_attention_query_token = 32   — number of learned query tokens
+        pre_attention_query_size = 1024  — dimension of each query
+        embedding_dim = 1024             — must match T3 hidden size (n_channels)
+        num_attn_heads = 4               — attention heads (head_dim = 1024/4 = 256)
+
+    Forward:
+        Input:  (B, 150, 1024) — speech conditioning embeddings
+        Output: (B, 32, 1024)  — compressed conditioning tokens
+
+    Parameters:
+        pre_attention_query : nn.Parameter(1, 32, 1024) — ~32K params
+        attn (AttentionBlock2): ~4.2M params (4× Linear(1024,1024) + LayerNorm)
+        Total: ~4.2M parameters
+    """
     def __init__(self, pre_attention_query_token=32, pre_attention_query_size=1024, embedding_dim=1024, num_attn_heads=4):
         """
-        Initialize the perceiver module.
-
-        :param pre_attention_query_token: Number of query tokens for pre-attention
-        :param pre_attention_query_size: Size of each query token
-        :param embedding_dim: Dimension of the embedding space
-        :param num_attn_heads: Number of attention heads
+        Args:
+            pre_attention_query_token: Number of learned query tokens (default 32).
+                Controls output sequence length: input (B, S, D) → output (B, 32, D).
+            pre_attention_query_size: Dimension of each query token (default 1024).
+                Must match embedding_dim.
+            embedding_dim: Transformer hidden dimension (default 1024).
+                Must match T3Config.n_channels.
+            num_attn_heads: Number of attention heads (default 4).
+                head_dim = embedding_dim / num_attn_heads = 256.
         """
         super().__init__()
 
@@ -198,10 +262,19 @@ class Perceiver(nn.Module):
         self.attn = AttentionBlock2(embedding_dim, num_attn_heads)
 
     def forward(self, h):
-        """
-        Forward pass of the perceiver module.
-        :param h: Input tensor
-        :return: Output after applying attention mechanisms
+        """Compress input sequence via cross-attention then self-attention.
+
+        Args:
+            h: (B, S, 1024) — input speech conditioning embeddings.
+               Typically S=150 (speech_cond_prompt_len from T3Config).
+
+        Returns:
+            (B, 32, 1024) — compressed conditioning tokens.
+
+        Steps:
+            1. Expand learned queries: (1, 32, 1024) → (B, 32, 1024)
+            2. Cross-attention: Q=queries, K=V=h → (B, 32, 1024) + residual
+            3. Self-attention: Q=K=V=pre_att → (B, 32, 1024) + residual
         """
         # Expand the pre-attention query to match the batch size of the input
         query_ = self.pre_attention_query.expand(h.shape[0], -1, -1)

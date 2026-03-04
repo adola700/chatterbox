@@ -1,3 +1,39 @@
+"""
+S3Tokenizer — Speech-to-Token encoder for Chatterbox TTS.
+
+Converts raw audio waveforms into discrete speech tokens used by both T3 (as targets)
+and S3Gen (as input for mel generation).
+
+Constants
+---------
+S3_SR = 16,000 Hz          — REQUIRED input sample rate. Audio MUST be resampled to 16kHz.
+S3_HOP = 160               — STFT hop length (10ms at 16kHz) → 100 mel frames/sec
+S3_TOKEN_HOP = 640          — Token hop length (40ms at 16kHz) → 25 tokens/sec
+S3_TOKEN_RATE = 25           — Output token rate: 25 tokens per second of audio
+SPEECH_VOCAB_SIZE = 6561     — Number of valid speech tokens (IDs 0-6560)
+
+Token special values (defined in __init__.py):
+    SOS = 6561               — Start-of-speech (used by T3)
+    EOS = 6562               — End-of-speech (used by T3)
+
+Pipeline
+--------
+    16kHz audio → log_mel_spectrogram → S3TokenizerV2.quantize → speech tokens
+
+    Mel spectrogram: n_fft=400, hop=160, 128 mel bands (from s3tokenizer config)
+    Produces 100 mel frames/sec, quantized to 25 tokens/sec (4 mel frames per token)
+
+Example
+-------
+    tokenizer = S3Tokenizer("speech_tokenizer_v2_25hz")
+    # Input: 16kHz audio tensor, shape (1, num_samples) or list of numpy arrays
+    tokens, token_lens = tokenizer(audio_16k)
+    # tokens: (B, T) long, where T = ceil(audio_duration_sec * 25)
+    # token_lens: (B,) long — actual token count per sample
+
+    For 6 seconds of audio: T = 6 * 25 = 150 tokens
+    For 10 seconds of audio: T = 10 * 25 = 250 tokens
+"""
 from typing import List, Tuple
 
 import numpy as np
@@ -11,19 +47,28 @@ from s3tokenizer.model_v2 import (
 )
 
 
-# Sampling rate of the inputs to S3TokenizerV2
-S3_SR = 16_000
-S3_HOP = 160  # 100 frames/sec
-S3_TOKEN_HOP = 640  # 25 tokens/sec
-S3_TOKEN_RATE = 25
-SPEECH_VOCAB_SIZE = 6561
+# ⚠ CRITICAL: S3Tokenizer ONLY accepts 16kHz audio. Feeding 24kHz produces garbage tokens.
+S3_SR = 16_000              # Required input sample rate
+S3_HOP = 160                # STFT hop length → 100 mel frames/sec at 16kHz
+S3_TOKEN_HOP = 640          # Token hop length → 25 tokens/sec at 16kHz
+S3_TOKEN_RATE = 25           # Output: 25 discrete speech tokens per second
+SPEECH_VOCAB_SIZE = 6561     # Valid speech token IDs: [0, 6560]
 
 
 class S3Tokenizer(S3TokenizerV2):
-    """
-    s3tokenizer.S3TokenizerV2 with the following changes:
-    - a more integrated `forward`
-    - compute `log_mel_spectrogram` using `_mel_filters` and `window` in `register_buffers`
+    """S3Tokenizer — Converts 16kHz audio to discrete speech tokens at 25 tokens/sec.
+
+    Inherits from s3tokenizer.S3TokenizerV2 with additions:
+    - Integrated forward() that handles list-of-arrays input
+    - log_mel_spectrogram() using registered buffer mel filters (GPU-friendly)
+
+    Mel spectrogram config:
+        n_fft:    400 (25ms window at 16kHz)
+        hop:      160 (10ms hop → 100 frames/sec)
+        n_mels:   128 (from ModelConfig)
+        window:   Hann
+
+    Quantization: 100 mel frames → 25 tokens (4:1 compression by the VQ encoder)
     """
 
     ignore_state_dict_missing = ("_mel_filters", "window")
@@ -94,15 +139,34 @@ class S3Tokenizer(S3TokenizerV2):
         accelerator: 'Accelerator'=None,
         max_len: int=None,
     ) -> Tuple[torch.Tensor, torch.LongTensor]:
-        """
-        NOTE: mel-spec has a hop size of 160 points (100 frame/sec).
-        FIXME: this class inherits `nn.Module` but doesn't accept `torch.Tensor` and handles a list of wavs one by one, which is unexpected.
+        """Tokenize 16kHz audio into discrete speech tokens.
 
-        Args
-        ----
-        - `wavs`: 16 kHz speech audio
-        - `max_len` max length to truncate the output sequence to (25 token/sec).
-        NOTE: please pad the waveform if longer sequence is needed.
+        ⚠ Input MUST be 16kHz. Feeding other sample rates produces garbage tokens.
+
+        Args:
+            wavs: 16kHz speech audio. Accepts:
+                  - torch.Tensor of shape (1, num_samples) or (num_samples,)
+                  - List of numpy arrays [np.ndarray(num_samples,), ...]
+                  - List of tensors [(1, num_samples), ...]
+            max_len: Maximum output token sequence length (at 25 tok/sec).
+                     If set, truncates mel to max_len*4 frames before quantization.
+                     For 6s reference: max_len=150. For 10s: max_len=250.
+
+        Returns:
+            speech_tokens: (B, T) long — discrete token IDs in range [0, 6560]
+                           T = ceil(audio_duration_sec * 25)
+            speech_token_lens: (B,) long — actual token count per sample
+
+        Pipeline:
+            1. wavs → log_mel_spectrogram() → (1, 128, num_frames)  [100 frames/sec]
+            2. Optional truncation: mel[:, :, :max_len*4]
+            3. padding() → batched mels
+            4. quantize(mels, mel_lens) → (B, T) tokens at 25 tok/sec
+
+        Examples:
+            1 second audio (16000 samples)  → ~25 tokens
+            6 seconds audio (96000 samples) → ~150 tokens
+            10 seconds audio (160000 samples) → ~250 tokens
         """
         processed_wavs = self._prepare_audio(wavs)
         mels, mel_lens = [], []
@@ -130,22 +194,32 @@ class S3Tokenizer(S3TokenizerV2):
         audio: torch.Tensor,
         padding: int = 0,
     ):
-        """
-        Compute the log-Mel spectrogram of
+        """Compute log-mel spectrogram for S3Tokenizer quantization.
 
-        Parameters
-        ----------
-        audio: torch.Tensor, shape = (*)
-            The path to audio or either a NumPy array or Tensor containing the
-            audio waveform in 16 kHz
+        ⚠ Input MUST be 16kHz audio.
 
-        padding: int
-            Number of zero samples to pad to the right
+        Args:
+            audio: torch.Tensor — 16kHz waveform
+                   Shape: (num_samples,) or (1, num_samples) or (B, num_samples)
+            padding: int — number of zero samples to pad to the right
 
-        Returns
-        -------
-        torch.Tensor, shape = (128, n_frames)
-            A Tensor that contains the Mel spectrogram
+        Returns:
+            log_mel: torch.Tensor, shape (B, 128, n_frames)
+                     n_frames ≈ num_samples / S3_HOP = num_samples / 160
+                     At 16kHz: 100 mel frames per second of audio.
+
+        STFT config:
+            n_fft:      400 (25ms window at 16kHz)
+            hop_length: 160 (10ms hop at 16kHz → 100 frames/sec)
+            window:     Hann (registered buffer)
+            mel_bands:  128 (via registered _mel_filters)
+
+        Post-processing:
+            1. magnitude² of STFT
+            2. mel filterbank projection (128 bands)
+            3. log10, clamped to min=1e-10
+            4. max-normalized: clamp to (max - 8.0)
+            5. shifted and scaled: (log_spec + 4.0) / 4.0
         """
         if not torch.is_tensor(audio):
             audio = torch.from_numpy(audio)

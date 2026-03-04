@@ -1,3 +1,55 @@
+"""
+ChatterboxTTS — English-only Text-to-Speech pipeline.
+
+Full inference pipeline:
+========================
+    1. prepare_conditionals(audio_prompt_path):
+       │
+       ├─ librosa.load(wav, sr=24000) → s3gen_ref_wav
+       ├─ resample to 16kHz → ref_16k_wav
+       │
+       ├─ S3Gen.embed_ref(s3gen_ref_wav[:10s], 24kHz):
+       │   ├─ mel_spectrogram(24kHz audio) → prompt_feat (1, T_mel, 80)
+       │   ├─ CAMPPlus(16kHz audio) → embedding (1, 192) [x-vector]
+       │   └─ S3Tokenizer(16kHz audio) → prompt_token (1, T_ref)
+       │   → Returns ref_dict for S3Gen decoder
+       │
+       ├─ S3Tokenizer(ref_16k[:6s], max_len=150):
+       │   → cond_prompt_speech_tokens (1, 150)     [for T3 conditioning]
+       │
+       ├─ VoiceEncoder.embeds_from_wavs([ref_16k]):
+       │   → speaker_emb (1, 256) [L2-normalized]   [for T3 conditioning]
+       │
+       └─ Build T3Cond + Conditionals(t3_cond, s3gen_ref_dict)
+
+    2. generate(text):
+       │
+       ├─ punc_norm(text) → cleaned text
+       ├─ tokenizer.text_to_tokens(text) → (1, L_text)
+       ├─ Duplicate for CFG: (2, L_text)
+       ├─ Add start(255)/stop(0) tokens → (2, L_text+2)
+       │
+       ├─ T3.inference(t3_cond, text_tokens):
+       │   → speech_tokens (1, N) — N speech tokens at 25 tok/sec
+       │
+       ├─ drop_invalid_tokens → remove SOS/EOS
+       ├─ Filter: speech_tokens[speech_tokens < 6561]
+       │
+       ├─ S3Gen.inference(speech_tokens, ref_dict):
+       │   → wav (1, num_samples) at 24kHz
+       │
+       └─ Perth watermark → final audio tensor
+
+    Output: (1, num_samples) tensor at 24,000 Hz
+
+Key constants:
+    ENC_COND_LEN = 6 * 16000 = 96,000 samples  — T3 reference audio cap (6 seconds at 16kHz)
+    DEC_COND_LEN = 10 * 24000 = 240,000 samples — S3Gen reference audio cap (10 seconds at 24kHz)
+
+Default voice:
+    When no audio_prompt_path is given, uses conds.pt (pre-computed Conditionals)
+    from the HuggingFace repo. This is a fixed English female voice.
+"""
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -180,28 +232,63 @@ class ChatterboxTTS:
         return cls.from_local(Path(local_path).parent, device)
 
     def prepare_conditionals(self, wav_fpath, exaggeration=0.5):
-        ## Load reference wav
-        s3gen_ref_wav, _sr = librosa.load(wav_fpath, sr=S3GEN_SR)
+        """Extract all conditioning from a reference audio file.
 
-        ref_16k_wav = librosa.resample(s3gen_ref_wav, orig_sr=S3GEN_SR, target_sr=S3_SR)
+        This prepares both T3 conditioning (for text→token generation) and
+        S3Gen conditioning (for token→waveform synthesis).
 
-        s3gen_ref_wav = s3gen_ref_wav[:self.DEC_COND_LEN]
+        Args:
+            wav_fpath: str — path to reference WAV file (any sample rate, resampled internally)
+            exaggeration: float — emotion exaggeration (0.0=neutral, 1.0=max). Default 0.5.
+
+        Side effects:
+            Sets self.conds = Conditionals(t3_cond, s3gen_ref_dict)
+
+        T3 conditioning (stored in self.conds.t3):
+            speaker_emb:                (1, 256) — VoiceEncoder L2-normed embedding from 16kHz ref
+            cond_prompt_speech_tokens:  (1, 150) — S3Tokenizer tokens from first 6s of 16kHz ref
+            emotion_adv:                (1, 1, 1) — exaggeration scalar
+
+        S3Gen conditioning (stored in self.conds.gen):
+            prompt_token:     (1, T_ref) — S3 tokens from 16kHz ref (up to 10s)
+            prompt_token_len: (1,) — token count
+            prompt_feat:      (1, T_mel, 80) — mel from 24kHz ref (up to 10s)
+            embedding:        (1, 192) — CAMPPlus x-vector from 16kHz ref
+
+        Internal flow:
+            1. Load wav at 24kHz (for S3Gen mel conditioning)
+            2. Resample to 16kHz (for S3Tokenizer + VoiceEncoder)
+            3. Truncate 24kHz to 10s (DEC_COND_LEN) → S3Gen.embed_ref()
+            4. Truncate 16kHz to 6s (ENC_COND_LEN) → S3Tokenizer(max_len=150)
+            5. Full 16kHz → VoiceEncoder.embeds_from_wavs() → speaker_emb
+        """
+        ## Load reference wav at 24kHz (S3Gen's native rate)
+        s3gen_ref_wav, _sr = librosa.load(wav_fpath, sr=S3GEN_SR)  # (num_samples,) at 24kHz
+
+        # Resample to 16kHz for S3Tokenizer and VoiceEncoder
+        ref_16k_wav = librosa.resample(s3gen_ref_wav, orig_sr=S3GEN_SR, target_sr=S3_SR)  # (num_samples_16k,)
+
+        # S3Gen reference conditioning (up to 10s of 24kHz audio)
+        s3gen_ref_wav = s3gen_ref_wav[:self.DEC_COND_LEN]  # truncate to 10s * 24kHz = 240,000 samples
         s3gen_ref_dict = self.s3gen.embed_ref(s3gen_ref_wav, S3GEN_SR, device=self.device)
 
-        # Speech cond prompt tokens
-        if plen := self.t3.hp.speech_cond_prompt_len:
+        # T3 speech conditioning tokens (up to 6s of 16kHz audio → 150 tokens)
+        if plen := self.t3.hp.speech_cond_prompt_len:  # plen = 150
             s3_tokzr = self.s3gen.tokenizer
+            # ref_16k_wav[:ENC_COND_LEN] = first 6s at 16kHz = 96,000 samples
+            # max_len=150 → truncate to 150 tokens (6s * 25 tok/s)
             t3_cond_prompt_tokens, _ = s3_tokzr.forward([ref_16k_wav[:self.ENC_COND_LEN]], max_len=plen)
-            t3_cond_prompt_tokens = torch.atleast_2d(t3_cond_prompt_tokens).to(self.device)
+            t3_cond_prompt_tokens = torch.atleast_2d(t3_cond_prompt_tokens).to(self.device)  # (1, 150)
 
-        # Voice-encoder speaker embedding
+        # VoiceEncoder speaker embedding from full 16kHz reference
+        # embeds_from_wavs: internally computes mel → LSTM → L2-norm → (1, 256)
         ve_embed = torch.from_numpy(self.ve.embeds_from_wavs([ref_16k_wav], sample_rate=S3_SR))
-        ve_embed = ve_embed.mean(axis=0, keepdim=True).to(self.device)
+        ve_embed = ve_embed.mean(axis=0, keepdim=True).to(self.device)  # (1, 256)
 
         t3_cond = T3Cond(
-            speaker_emb=ve_embed,
-            cond_prompt_speech_tokens=t3_cond_prompt_tokens,
-            emotion_adv=exaggeration * torch.ones(1, 1, 1),
+            speaker_emb=ve_embed,                           # (1, 256)
+            cond_prompt_speech_tokens=t3_cond_prompt_tokens, # (1, 150)
+            emotion_adv=exaggeration * torch.ones(1, 1, 1),  # (1, 1, 1)
         ).to(device=self.device)
         self.conds = Conditionals(t3_cond, s3gen_ref_dict)
 
@@ -216,6 +303,35 @@ class ChatterboxTTS:
         cfg_weight=0.5,
         temperature=0.8,
     ):
+        """Generate speech audio from text.
+
+        Args:
+            text: str — input text to synthesize
+            audio_prompt_path: Optional str — reference audio for voice cloning.
+                              If None, uses self.conds (built-in voice or previous prepare_conditionals).
+            exaggeration: float — emotion exaggeration (0.0-1.0, default 0.5)
+            cfg_weight: float — Classifier-Free Guidance weight (default 0.5)
+                       Higher = more faithful to text, lower = more natural
+            temperature: float — sampling temperature (default 0.8)
+            repetition_penalty: float — penalty for repeated tokens (default 1.2)
+            min_p: float — minimum probability filter (default 0.05)
+            top_p: float — nucleus sampling (default 1.0 = disabled)
+
+        Returns:
+            wav: (1, num_samples) tensor — watermarked 24kHz audio waveform
+
+        Pipeline:
+            1. prepare_conditionals(audio_prompt_path) if provided
+            2. punc_norm(text) → text cleanup
+            3. tokenizer.text_to_tokens(text) → (1, L_text)
+            4. Duplicate for CFG → (2, L_text)
+            5. Add start(255)/stop(0) → (2, L_text+2)
+            6. T3.inference(t3_cond, text_tokens) → speech_tokens (1, N)
+            7. drop_invalid_tokens → remove SOS(6561)/EOS(6562)
+            8. Filter tokens < 6561 (safety against out-of-vocab)
+            9. S3Gen.inference(speech_tokens, ref_dict) → wav (1, samples)
+            10. Perth watermark → final audio
+        """
         if audio_prompt_path:
             self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
         else:

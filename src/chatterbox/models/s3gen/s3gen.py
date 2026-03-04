@@ -45,10 +45,40 @@ def get_resampler(src_sr, dst_sr, device):
 
 
 class S3Token2Mel(torch.nn.Module):
-    """
-    S3Gen's CFM decoder maps S3 speech tokens to mel-spectrograms.
+    """S3Gen's token-to-mel decoder — converts discrete speech tokens to mel spectrograms.
 
-    TODO: make these modules configurable?
+    This is the first half of S3Gen. It takes speech tokens (from T3 or S3Tokenizer)
+    and reference audio conditioning, and generates mel spectrograms via Conditional
+    Flow Matching (CFM).
+
+    Components
+    ----------
+    tokenizer : S3Tokenizer
+        Speech tokenizer (16kHz → 25 tok/sec). Used for encoding reference audio.
+        Input: 16kHz audio → Output: (B, T) tokens, T = 25 * duration_sec
+
+    speaker_encoder : CAMPPlus
+        X-vector speaker encoder for S3Gen's flow model conditioning.
+        Input: 16kHz audio (B, num_samples) → Output: (B, 192) speaker embedding
+        NOTE: This is DIFFERENT from VoiceEncoder (which produces 256-dim for T3).
+
+    flow : CausalMaskedDiffWithXvec
+        The main CFM decoder. Maps speech tokens → mel spectrograms with speaker conditioning.
+        - input_embedding: Embedding(6561, 512) — embeds speech tokens
+        - encoder: UpsampleConformerEncoder — upsamples tokens 2x (25 tok/s → 50 mel frames/s??)
+        - decoder: CausalConditionalCFM — flow matching with speaker conditioning
+        - token_mel_ratio: 2 (each token → 2 mel frames)
+
+    Reference conditioning (embed_ref output)
+    ------------------------------------------
+    embed_ref() produces a dict with:
+        prompt_token:     (1, T_ref) long — S3 tokens of reference audio (from 16kHz)
+        prompt_token_len: (1,) long — reference token count
+        prompt_feat:      (1, T_mel, 80) float — mel spectrogram of reference (from 24kHz)
+        prompt_feat_len:  None
+        embedding:        (1, 192) float — CAMPPlus x-vector speaker embedding
+
+    The mel/token ratio MUST be 2:1 (enforced with warning + truncation).
     """
     def __init__(self, meanflow=False):
         super().__init__()
@@ -122,6 +152,34 @@ class S3Token2Mel(torch.nn.Module):
         device="auto",
         ref_fade_out=True,
     ):
+        """Extract reference audio conditioning for S3Gen's flow model.
+
+        Processes reference audio into three conditioning signals:
+        1. Mel spectrogram at 24kHz (for acoustic conditioning)
+        2. S3 tokens at 16kHz (for token-level conditioning)
+        3. CAMPPlus x-vector at 16kHz (for speaker conditioning)
+
+        Args:
+            ref_wav: Reference waveform — numpy array or tensor, shape (num_samples,) or (1, num_samples)
+                     Max 10 seconds (DEC_COND_LEN = 10 * 24000 = 240,000 samples at 24kHz).
+            ref_sr:  Sample rate of ref_wav (will be resampled to 24kHz and 16kHz internally)
+            device:  Target device ("auto" uses self.device)
+
+        Returns:
+            dict with:
+                prompt_token:     (1, T_ref) long — S3 tokens from 16kHz reference
+                                  T_ref = ceil(duration_sec * 25)
+                prompt_token_len: (1,) long — actual token count
+                prompt_feat:      (1, T_mel, 80) float — mel spectrogram from 24kHz reference
+                                  T_mel should equal 2 * T_ref (enforced with warning)
+                prompt_feat_len:  None
+                embedding:        (1, 192) float — CAMPPlus x-vector speaker embedding
+
+        Internal pipeline:
+            ref_wav → resample to 24kHz → mel_spectrogram → prompt_feat (1, T_mel, 80)
+            ref_wav → resample to 16kHz → S3Tokenizer → prompt_token (1, T_ref)
+            ref_wav → resample to 16kHz → CAMPPlus → embedding (1, 192)
+        """
         device = self.device if device == "auto" else device
         if isinstance(ref_wav, np.ndarray):
             ref_wav = torch.from_numpy(ref_wav).float()
@@ -230,10 +288,34 @@ class S3Token2Mel(torch.nn.Module):
 
 
 class S3Token2Wav(S3Token2Mel):
-    """
-    The decoder of S3Gen is a concat of token-to-mel (CFM) and a mel-to-waveform (HiFiGAN) modules.
+    """S3Gen full decoder — speech tokens → mel → waveform.
 
-    TODO: make these modules configurable?
+    Combines token-to-mel (CFM flow model) with mel-to-waveform (HiFi-GAN vocoder).
+    This is the class instantiated as `S3Gen()` in Chatterbox.
+
+    Components (inherited from S3Token2Mel):
+        tokenizer:        S3Tokenizer — 16kHz audio → tokens
+        speaker_encoder:  CAMPPlus — 16kHz audio → (B, 192) x-vector
+        flow:             CausalMaskedDiffWithXvec — tokens → mel
+
+    Additional components:
+        mel2wav:          HiFTGenerator — mel spectrogram → 24kHz waveform
+                          Upsample rates: [8, 5, 3] → total 120x
+                          With f0 predictor (ConvRNNF0Predictor)
+        trim_fade:        Buffer — cosine fade-in to reduce reference spillover
+
+    Full inference pipeline:
+        speech_tokens (B, T) → flow_inference → mel (B, 80, T*2) → hift_inference → wav (B, T*240)
+
+    Output sample rate: 24,000 Hz (S3GEN_SR)
+
+    Example:
+        s3gen = S3Gen()  # alias for S3Token2Wav
+        wav, sources = s3gen.inference(
+            speech_tokens=tokens,       # (1, N) long, N speech tokens
+            ref_dict=ref_conditioning,  # from embed_ref()
+        )
+        # wav: (1, N * 960) float — 24kHz waveform (each token → 40ms → 960 samples)
     """
 
     ignore_state_dict_missing = ("tokenizer._mel_filters", "tokenizer.window")
@@ -340,9 +422,32 @@ class S3Token2Wav(S3Token2Mel):
         n_cfm_timesteps=None,
         speech_token_lens=None,
     ):
-        # hallucination prevention, drop special tokens
-        # if drop_invalid_tokens:
-        #     speech_tokens, speech_token_lens = drop_invalid(speech_tokens, pad=S3_QUIET_PAD)
+        """Full inference: speech tokens → waveform.
+
+        This is the main entry point for converting T3-generated speech tokens into audio.
+
+        Args:
+            speech_tokens:    (1, N) or (N,) long — speech token IDs in [0, 6560]
+                              ⚠ Tokens >= 6561 will cause CUDA crash in flow.input_embedding!
+                              Use drop_invalid_tokens or clamp before calling.
+            ref_wav:          Optional (1, num_samples) float — reference waveform (any sample rate)
+                              Mutually exclusive with ref_dict.
+            ref_sr:           int — sample rate of ref_wav
+            ref_dict:         Optional dict — pre-computed reference conditioning from embed_ref()
+                              Keys: prompt_token, prompt_token_len, prompt_feat, prompt_feat_len, embedding
+            n_cfm_timesteps:  int — CFM denoising steps (default: 2 for meanflow, 10 otherwise)
+            speech_token_lens: Optional (B,) long — token lengths for batched input
+
+        Returns:
+            output_wavs:    (1, num_audio_samples) float — 24kHz waveform
+                            Duration ≈ N_tokens * 40ms (each token → 2 mel frames → 960 audio samples)
+            output_sources: (1, 1, num_audio_samples) — HiFi-GAN source signal (for f0)
+
+        Pipeline:
+            1. flow_inference(tokens, ref_dict) → mel (1, 80, N*2)
+            2. hift_inference(mel) → wav (1, num_samples) at 24kHz
+            3. Cosine fade-in (20ms) to reduce reference spillover artifact
+        """
 
         output_mels = self.flow_inference(
             speech_tokens,

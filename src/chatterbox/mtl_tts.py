@@ -1,3 +1,45 @@
+"""
+ChatterboxMultilingualTTS — Multilingual text-to-speech inference pipeline.
+
+Supports 23 languages (see SUPPORTED_LANGUAGES dict). Uses the same 4-component
+architecture as the English-only ChatterboxTTS but with:
+    - MTLTokenizer (grapheme-based, vocab=2454) instead of EnTokenizer (vocab=704)
+    - T3 with T3Config.multilingual() (text_tokens_dict_size=2454)
+    - A `language_id` parameter in generate() to select target language
+
+Architecture (same components, different text tokenizer + T3 config)
+====================================================================
+    VoiceEncoder  →  speaker_emb (B, 256)          — speaker identity
+    S3Tokenizer   →  cond_prompt_speech_tokens (B, 150)  — speech style conditioning
+    T3            →  speech_tokens (1, T)           — autoregressive text→token generation
+    S3Gen         →  waveform (1, num_samples)      — token→audio synthesis at 24kHz
+
+Inference pipeline
+==================
+    1. Load reference audio → resample to 24kHz (S3Gen) and 16kHz (VE + S3Tokenizer)
+    2. VoiceEncoder: 16kHz ref → speaker_emb (1, 256)
+    3. S3Tokenizer: 16kHz ref[:6s] → cond_prompt_speech_tokens (1, 150)
+    4. S3Gen.embed_ref: 24kHz ref[:10s] → ref_dict (prompt conditioning for CFM decoder)
+    5. MTLTokenizer: text + language_id → text_tokens (1, N)
+    6. T3.inference: [cond(34) | text(N+2) | speech(?)] → speech_tokens (1, T)
+    7. S3Gen.inference: speech_tokens + ref_dict → wav (1, num_samples) at 24kHz
+    8. Perth watermarking → watermarked wav
+
+Key differences from English-only ChatterboxTTS (tts.py)
+=========================================================
+    - text_tokens_dict_size: 2454 vs 704
+    - Tokenizer: MTLTokenizer (grapheme) vs EnTokenizer (phoneme-based)
+    - generate() takes `language_id` param (ISO 639-1 code, e.g. "el", "fr", "zh")
+    - T3 checkpoint: t3_mtl23ls_v2.safetensors vs t3_cfg.safetensors
+    - Conditionals cache file: conds.pt (shared with English version)
+
+Constants
+---------
+    S3_SR = 16,000 Hz       — S3Tokenizer + VoiceEncoder sample rate
+    S3GEN_SR = 24,000 Hz    — S3Gen output sample rate
+    ENC_COND_LEN = 96,000   — 6 seconds at 16kHz (S3Tokenizer conditioning input)
+    DEC_COND_LEN = 240,000  — 10 seconds at 24kHz (S3Gen reference input)
+"""
 from dataclasses import dataclass
 from pathlib import Path
 import os
@@ -92,20 +134,31 @@ def punc_norm(text: str) -> str:
 
 @dataclass
 class Conditionals:
-    """
-    Conditionals for T3 and S3Gen
-    - T3 conditionals:
-        - speaker_emb
-        - clap_emb
-        - cond_prompt_speech_tokens
-        - cond_prompt_speech_emb
-        - emotion_adv
-    - S3Gen conditionals:
-        - prompt_token
-        - prompt_token_len
-        - prompt_feat
-        - prompt_feat_len
-        - embedding
+    """Container for all pre-computed conditioning signals used during inference.
+
+    Holds both T3 (autoregressive token generation) and S3Gen (mel synthesis) conditioning.
+
+    Fields
+    ------
+    t3 : T3Cond
+        T3 conditioning dataclass containing:
+            speaker_emb              : (1, 256) — L2-normalized VoiceEncoder embedding
+            cond_prompt_speech_tokens: (1, 150) — S3Tokenizer tokens from 6s reference
+            cond_prompt_speech_emb   : None (computed lazily by T3.prepare_conditioning)
+            emotion_adv              : (1, 1, 1) — emotion exaggeration scalar [0.0-1.0]
+
+    gen : dict
+        S3Gen reference conditioning dict from S3Gen.embed_ref(), containing:
+            prompt_token     : (1, T_ref) long — S3 tokens from reference audio
+            prompt_token_len : (1,) long — length of prompt tokens
+            prompt_feat      : (1, T_mel, 100) — mel spectrogram of reference
+            prompt_feat_len  : (1,) long — length of mel features
+            embedding        : (1, 192) — speaker verification embedding (ECAPA-TDNN)
+
+    Serialization
+    -------------
+        conds.save("conds.pt")           — saves t3.__dict__ + gen dict
+        Conditionals.load("conds.pt")    — restores from file
     """
     t3: T3Cond
     gen: dict
@@ -131,6 +184,28 @@ class Conditionals:
 
 
 class ChatterboxMultilingualTTS:
+    """Multilingual text-to-speech model supporting 23 languages.
+
+    Components (same as English-only, different T3 config + tokenizer)
+    ------------------------------------------------------------------
+    t3        : T3 — Autoregressive text→speech token model (LlamaModel backbone)
+                Config: T3Config.multilingual() → text_tokens_dict_size=2454
+    s3gen     : S3Gen — Speech token→waveform synthesis (CFM flow + HiFi-GAN vocoder)
+    ve        : VoiceEncoder — 3-layer LSTM speaker encoder (40-mel → 256-dim)
+    tokenizer : MTLTokenizer — Grapheme-based multilingual tokenizer (vocab=2454)
+
+    Class constants
+    ---------------
+    ENC_COND_LEN = 96,000   — 6 seconds * 16kHz — max reference audio for S3Tokenizer
+    DEC_COND_LEN = 240,000  — 10 seconds * 24kHz — max reference audio for S3Gen
+
+    Attributes
+    ----------
+    sr          : int = 24,000 — output audio sample rate (S3GEN_SR)
+    device      : str — torch device ("cuda", "cpu")
+    conds       : Conditionals — pre-computed conditioning (set by prepare_conditionals)
+    watermarker : PerthImplicitWatermarker — applies Perth audio watermark to output
+    """
     ENC_COND_LEN = 6 * S3_SR
     DEC_COND_LEN = 10 * S3GEN_SR
 
@@ -204,6 +279,27 @@ class ChatterboxMultilingualTTS:
         return cls.from_local(ckpt_dir, device)
     
     def prepare_conditionals(self, wav_fpath, exaggeration=0.5):
+        """Compute all conditioning signals from a reference audio file.
+
+        Identical to ChatterboxTTS.prepare_conditionals(). Loads reference audio,
+        extracts speaker embedding, speech conditioning tokens, and S3Gen reference features.
+
+        Args:
+            wav_fpath: Path to reference audio file (any format librosa supports).
+            exaggeration: float [0.0-1.0] — emotion exaggeration level (default 0.5).
+
+        Internal pipeline:
+            1. librosa.load(wav_fpath, sr=24000) → s3gen_ref_wav (24kHz numpy)
+            2. Resample 24kHz → 16kHz → ref_16k_wav
+            3. S3Gen.embed_ref(ref_24k[:10s]) → s3gen_ref_dict
+               Keys: prompt_token (1, T), prompt_feat (1, T, 100), embedding (1, 192)
+            4. S3Tokenizer(ref_16k[:6s], max_len=150) → cond_prompt_speech_tokens (1, 150)
+            5. VoiceEncoder.embeds_from_wavs([ref_16k]) → speaker_emb (1, 256)
+            6. Assemble T3Cond + Conditionals → self.conds
+
+        Sets:
+            self.conds : Conditionals — ready for generate() calls.
+        """
         ## Load reference wav
         s3gen_ref_wav, _sr = librosa.load(wav_fpath, sr=S3GEN_SR)
 
@@ -242,6 +338,38 @@ class ChatterboxMultilingualTTS:
         min_p=0.05,
         top_p=1.0,
     ):
+        """Generate speech audio from text in a specified language.
+
+        Args:
+            text: str — Input text to synthesize.
+            language_id: str — ISO 639-1 language code (e.g. "el", "fr", "zh").
+                Must be in SUPPORTED_LANGUAGES (23 languages).
+            audio_prompt_path: Optional[str] — Path to reference audio for voice cloning.
+                If provided, calls prepare_conditionals() first.
+                If None, uses previously cached self.conds.
+            exaggeration: float — Emotion exaggeration [0.0-1.0] (default 0.5).
+            cfg_weight: float — Classifier-free guidance weight (default 0.5).
+                Higher = more text adherence, lower = more natural variation.
+            temperature: float — Sampling temperature for T3 (default 0.8).
+            repetition_penalty: float — Token repetition penalty (default 2.0).
+            min_p: float — Minimum probability threshold for sampling (default 0.05).
+            top_p: float — Nucleus sampling threshold (default 1.0 = disabled).
+
+        Returns:
+            torch.Tensor — Watermarked audio, shape (1, num_samples) at 24kHz.
+
+        Pipeline:
+            1. Validate language_id against SUPPORTED_LANGUAGES
+            2. prepare_conditionals() if audio_prompt_path given
+            3. Update emotion exaggeration if changed
+            4. punc_norm(text) → MTLTokenizer.text_to_tokens(text, language_id) → (1, N)
+            5. Duplicate text_tokens for CFG: (2, N) — [conditional, unconditional]
+            6. Prepend SOT (255), append EOT (0) → (2, N+2)
+            7. T3.inference(t3_cond, text_tokens) → speech_tokens (1, T)
+            8. drop_invalid_tokens() — remove tokens >= SPEECH_VOCAB_SIZE (6561)
+            9. S3Gen.inference(speech_tokens, ref_dict) → wav at 24kHz
+           10. Perth watermark → return (1, num_samples)
+        """
         # Validate language_id
         if language_id and language_id.lower() not in SUPPORTED_LANGUAGES:
             supported_langs = ", ".join(SUPPORTED_LANGUAGES.keys())
